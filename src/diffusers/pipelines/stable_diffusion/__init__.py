@@ -4,6 +4,7 @@ from typing import List, Optional, Union
 import numpy as np
 
 import PIL
+import torch
 from PIL import Image
 
 from ...utils import BaseOutput, is_flax_available, is_onnx_available, is_torch_available, is_transformers_available
@@ -25,6 +26,13 @@ class StableDiffusionPipelineOutput(BaseOutput):
 
     images: Union[List[PIL.Image.Image], np.ndarray]
     nsfw_content_detected: Optional[List[bool]]
+    text_input_ids: torch.Tensor = None
+    text_embeddings: torch.Tensor = None
+    uncond_embeddings: torch.Tensor = None
+    removed_partial_prompt: str = None
+    init_scaled_latents: torch.Tensor = None
+    all_latents: List[torch.Tensor] = None
+    all_latents_x0: List[torch.Tensor] = None
 
 
 if is_transformers_available() and is_torch_available():
