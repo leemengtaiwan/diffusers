@@ -275,6 +275,7 @@ class StableDiffusionImg2ImgPipeline(DiffusionPipeline):
         )
         text_input_ids = text_inputs.input_ids
 
+        removed_text = None
         if text_input_ids.shape[-1] > self.tokenizer.model_max_length:
             removed_text = self.tokenizer.batch_decode(text_input_ids[:, self.tokenizer.model_max_length :])
             logger.warning(
@@ -283,6 +284,7 @@ class StableDiffusionImg2ImgPipeline(DiffusionPipeline):
             )
             text_input_ids = text_input_ids[:, : self.tokenizer.model_max_length]
         text_embeddings = self.text_encoder(text_input_ids.to(self.device))[0]
+        raw_text_embeddings = torch.clone(text_embeddings).cpu()
 
         # duplicate text embeddings for each generation per prompt
         text_embeddings = text_embeddings.repeat_interleave(num_images_per_prompt, dim=0)
@@ -292,6 +294,7 @@ class StableDiffusionImg2ImgPipeline(DiffusionPipeline):
         # corresponds to doing no classifier free guidance.
         do_classifier_free_guidance = guidance_scale > 1.0
         # get unconditional embeddings for classifier free guidance
+        raw_uncond_embeddings = None
         if do_classifier_free_guidance:
             uncond_tokens: List[str]
             if negative_prompt is None:
@@ -317,6 +320,7 @@ class StableDiffusionImg2ImgPipeline(DiffusionPipeline):
                 return_tensors="pt",
             )
             uncond_embeddings = self.text_encoder(uncond_input.input_ids.to(self.device))[0]
+            raw_uncond_embeddings = torch.clone(uncond_embeddings).cpu()
 
             # duplicate unconditional embeddings for each generation per prompt
             uncond_embeddings = uncond_embeddings.repeat_interleave(batch_size * num_images_per_prompt, dim=0)
@@ -332,6 +336,7 @@ class StableDiffusionImg2ImgPipeline(DiffusionPipeline):
         init_latent_dist = self.vae.encode(init_image).latent_dist
         init_latents = init_latent_dist.sample(generator=generator)
         init_latents = 0.18215 * init_latents
+        init_scaled_latents = torch.clone(init_latents).to("cpu")
 
         if isinstance(prompt, str):
             prompt = [prompt]
@@ -355,15 +360,15 @@ class StableDiffusionImg2ImgPipeline(DiffusionPipeline):
 
         # get the original timestep using init_timestep
         offset = self.scheduler.config.get("steps_offset", 0)
-        init_timestep = int(num_inference_steps * strength) + offset
-        init_timestep = min(init_timestep, num_inference_steps)
+        init_step_idx = int(num_inference_steps * strength) + offset
+        init_step_idx = min(init_step_idx, num_inference_steps)
 
-        timesteps = self.scheduler.timesteps[-init_timestep]
-        timesteps = torch.tensor([timesteps] * batch_size * num_images_per_prompt, device=self.device)
+        init_step = self.scheduler.timesteps[-init_step_idx]
+        batch_init_steps = torch.tensor([init_step] * batch_size * num_images_per_prompt, device=self.device)
 
         # add noise to latents using the timesteps
         noise = torch.randn(init_latents.shape, generator=generator, device=self.device, dtype=latents_dtype)
-        init_latents = self.scheduler.add_noise(init_latents, noise, timesteps)
+        init_latents = self.scheduler.add_noise(init_latents, noise, batch_init_steps)
 
         # prepare extra kwargs for the scheduler step, since not all schedulers have the same signature
         # eta (η) is only used with the DDIMScheduler, it will be ignored for other schedulers.
@@ -381,11 +386,14 @@ class StableDiffusionImg2ImgPipeline(DiffusionPipeline):
 
         latents = init_latents
 
-        t_start = max(num_inference_steps - init_timestep + offset, 0)
+        t_start = max(num_inference_steps - init_step_idx + offset, 0)
 
         # Some schedulers like PNDM have timesteps as arrays
         # It's more optimized to move all timesteps to correct device beforehand
         timesteps = self.scheduler.timesteps[t_start:].to(self.device)
+
+        all_latents: List[torch.Tensor] = []
+        all_latents_x0: List[torch.Tensor] = []
 
         for i, t in enumerate(self.progress_bar(timesteps)):
             # expand the latents if we are doing classifier free guidance
@@ -400,8 +408,13 @@ class StableDiffusionImg2ImgPipeline(DiffusionPipeline):
                 noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
                 noise_pred = noise_pred_uncond + guidance_scale * (noise_pred_text - noise_pred_uncond)
 
-            # compute the previous noisy sample x_t -> x_t-1
-            latents = self.scheduler.step(noise_pred, t, latents, **extra_step_kwargs).prev_sample
+            # compute both the previous noisy sample x_t -> x_t-1 and predicted x0
+            scheduler_out = self.scheduler.step(noise_pred, t, latents, **extra_step_kwargs)
+            latents = scheduler_out.prev_sample
+            latents_x0 = scheduler_out.pred_original_sample
+
+            all_latents.append(latents.cpu())
+            all_latents_x0.append(latents_x0.cpu())
 
             # call the callback, if provided
             if callback is not None and i % callback_steps == 0:
@@ -429,4 +442,14 @@ class StableDiffusionImg2ImgPipeline(DiffusionPipeline):
         if not return_dict:
             return (image, has_nsfw_concept)
 
-        return StableDiffusionPipelineOutput(images=image, nsfw_content_detected=has_nsfw_concept)
+        return StableDiffusionPipelineOutput(
+            images=image,
+            nsfw_content_detected=has_nsfw_concept,
+            text_input_ids=text_input_ids,
+            text_embeddings=raw_text_embeddings,
+            uncond_embeddings=raw_uncond_embeddings,
+            removed_partial_prompt=removed_text,
+            init_scaled_latents=init_scaled_latents,
+            all_latents=all_latents,
+            all_latents_x0=all_latents_x0,
+        )

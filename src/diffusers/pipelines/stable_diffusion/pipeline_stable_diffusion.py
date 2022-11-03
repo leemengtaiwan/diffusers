@@ -296,6 +296,7 @@ class StableDiffusionPipeline(DiffusionPipeline):
         # corresponds to doing no classifier free guidance.
         do_classifier_free_guidance = guidance_scale > 1.0
         # get unconditional embeddings for classifier free guidance
+        raw_uncond_embeddings = None
         if do_classifier_free_guidance:
             uncond_tokens: List[str]
             if negative_prompt is None:
@@ -394,11 +395,12 @@ class StableDiffusionPipeline(DiffusionPipeline):
             noise_pred = self.unet(latent_model_input, t, encoder_hidden_states=text_embeddings).sample
 
             # perform guidance
+            # TODO: try DIffEdit
             if do_classifier_free_guidance:
                 noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
                 noise_pred = noise_pred_uncond + guidance_scale * (noise_pred_text - noise_pred_uncond)
 
-            # compute the previous noisy sample x_t -> x_t-1
+            # compute both the previous noisy sample x_t -> x_t-1 and predicted x0
             scheduler_out = self.scheduler.step(noise_pred, t, latents, **extra_step_kwargs)
             latents = scheduler_out.prev_sample
             latents_x0 = scheduler_out.pred_original_sample
