@@ -555,8 +555,13 @@ class StableDiffusionImg2ImgPipeline(DiffusionPipeline):
                 noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
                 noise_pred = noise_pred_uncond + guidance_scale * (noise_pred_text - noise_pred_uncond)
 
-            # compute the previous noisy sample x_t -> x_t-1
-            latents = self.scheduler.step(noise_pred, t, latents, **extra_step_kwargs).prev_sample
+            # compute both the previous noisy sample x_t -> x_t-1 and predicted x0
+            scheduler_out = self.scheduler.step(noise_pred, t, latents, **extra_step_kwargs)
+            latents = scheduler_out.prev_sample
+            latents_x0 = scheduler_out.pred_original_sample
+
+            all_latents.append(latents.cpu())
+            all_latents_x0.append(latents_x0.cpu())
 
             # call the callback, if provided
             if callback is not None and i % callback_steps == 0:
@@ -575,4 +580,14 @@ class StableDiffusionImg2ImgPipeline(DiffusionPipeline):
         if not return_dict:
             return (image, has_nsfw_concept)
 
-        return StableDiffusionPipelineOutput(images=image, nsfw_content_detected=has_nsfw_concept)
+        return StableDiffusionPipelineOutput(
+            images=image,
+            nsfw_content_detected=has_nsfw_concept,
+            text_input_ids=text_input_ids,
+            text_embeddings=raw_text_embeddings,
+            uncond_embeddings=raw_uncond_embeddings,
+            removed_partial_prompt=removed_text,
+            init_scaled_latents=init_scaled_latents,
+            all_latents=all_latents,
+            all_latents_x0=all_latents_x0,
+        )
