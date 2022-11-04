@@ -33,6 +33,7 @@ class StableDiffusionPipelineOutput(BaseOutput):
     init_scaled_latents: torch.Tensor = None
     all_latents: List[torch.Tensor] = None
     all_latents_x0: List[torch.Tensor] = None
+    animation: str = None
 
 
 if is_transformers_available() and is_torch_available():
