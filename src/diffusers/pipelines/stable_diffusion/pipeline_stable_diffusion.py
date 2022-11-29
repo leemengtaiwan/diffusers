@@ -550,7 +550,7 @@ class StableDiffusionPipeline(DiffusionPipeline):
             device,
             generator,
             latents,
-        )
+            )
 
         # 6. Prepare extra step kwargs. TODO: Logic should ideally just be moved out of the pipeline
         extra_step_kwargs = self.prepare_extra_step_kwargs(generator, eta)
@@ -593,14 +593,4 @@ class StableDiffusionPipeline(DiffusionPipeline):
         if not return_dict:
             return (image, has_nsfw_concept)
 
-        return StableDiffusionPipelineOutput(
-            images=image,
-            nsfw_content_detected=has_nsfw_concept,
-            text_input_ids=text_input_ids,
-            text_embeddings=raw_text_embeddings,
-            uncond_embeddings=raw_uncond_embeddings,
-            removed_partial_prompt=removed_text,
-            init_scaled_latents=init_scaled_latents,
-            all_latents=all_latents,
-            all_latents_x0=all_latents_x0,
-        )
+        return StableDiffusionPipelineOutput(images=image, nsfw_content_detected=has_nsfw_concept)
