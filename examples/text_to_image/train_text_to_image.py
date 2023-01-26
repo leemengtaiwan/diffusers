@@ -16,7 +16,10 @@
 import argparse
 import logging
 import math
+import wandb
 import os
+import gc
+import arrow
 import random
 from pathlib import Path
 from typing import Optional
@@ -25,6 +28,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 import torch.utils.checkpoint
+from torch.cuda.amp import autocast
 
 import datasets
 import diffusers
@@ -34,6 +38,9 @@ from accelerate.logging import get_logger
 from accelerate.utils import set_seed
 from datasets import load_dataset
 from diffusers import AutoencoderKL, DDPMScheduler, StableDiffusionPipeline, UNet2DConditionModel
+from diffusers import DiffusionPipeline, AltDiffusionPipeline
+from diffusers.pipelines.alt_diffusion import RobertaSeriesModelWithTransformation
+from diffusers import PNDMScheduler, DDIMScheduler
 from diffusers.optimization import get_scheduler
 from diffusers.training_utils import EMAModel
 from diffusers.utils import check_min_version
@@ -42,6 +49,8 @@ from huggingface_hub import HfFolder, Repository, create_repo, whoami
 from torchvision import transforms
 from tqdm.auto import tqdm
 from transformers import CLIPTextModel, CLIPTokenizer
+from transformers import XLMRobertaTokenizer
+
 
 
 # Will error if the minimal version of diffusers is not installed. Remove at your own risks.
@@ -285,6 +294,63 @@ def parse_args():
     parser.add_argument(
         "--enable_xformers_memory_efficient_attention", action="store_true", help="Whether or not to use xformers."
     )
+    
+    # --- inference related
+    parser.add_argument(
+        "--project_name",
+        type=str,
+        default=None,
+        required=True,
+        help="",
+    )
+    parser.add_argument(
+        "--eval_batch_size",
+        type=int,
+        default=32, 
+        help=""
+    )
+    parser.add_argument(
+        "--eval_steps",
+        type=int,
+        default=100, 
+        help=""
+    )
+    parser.add_argument(
+        "--num_inference_steps",
+        type=int,
+        default=50, 
+        help=""
+    )
+    parser.add_argument(
+        "--num_log_image_size",
+        type=int,
+        default=32, 
+        help=""
+    )    
+    parser.add_argument(
+        "--inference_scheduler_cls",
+        type=str,
+        default="PNDMScheduler", 
+        help=""
+    )
+    
+    # --- training related
+    parser.add_argument(
+        "--finetune_strategry",
+        type=str,
+        default=None, 
+        required=True,
+        help=""
+    )
+    
+    parser.add_argument(
+        "--condition_dropping_rate",
+        type=float,
+        default=0, 
+        help=""
+    )
+    
+    
 
     args = parser.parse_args()
     env_local_rank = int(os.environ.get("LOCAL_RANK", -1))
@@ -325,7 +391,7 @@ def main():
         gradient_accumulation_steps=args.gradient_accumulation_steps,
         mixed_precision=args.mixed_precision,
         log_with=args.report_to,
-        logging_dir=logging_dir,
+        logging_dir=os.path.join(args.output_dir, args.logging_dir),
     )
 
     # Make one log on every process with the configuration for debugging.
@@ -335,6 +401,7 @@ def main():
         level=logging.INFO,
     )
     logger.info(accelerator.state, main_process_only=False)
+    
     if accelerator.is_local_main_process:
         datasets.utils.logging.set_verbosity_warning()
         transformers.utils.logging.set_verbosity_warning()
@@ -347,6 +414,9 @@ def main():
     # If passed along, set the training seed now.
     if args.seed is not None:
         set_seed(args.seed)
+        logger.info(f"Seed: {args.seed}")
+    else:
+        logger.warning("Seed is not set. The result might not be reproducible.")
 
     # Handle the repository creation
     if accelerator.is_main_process:
@@ -367,11 +437,24 @@ def main():
             os.makedirs(args.output_dir, exist_ok=True)
 
     # Load scheduler, tokenizer and models.
+    inference_scheduler = eval(args.inference_scheduler_cls).from_pretrained(
+        args.pretrained_model_name_or_path, subfolder="scheduler")
+    
+    if args.pretrained_model_name_or_path == "BAAI/AltDiffusion-m9":
+        tokenizer_cls = XLMRobertaTokenizer
+        text_encoder_cls = RobertaSeriesModelWithTransformation
+        pipe_cls = AltDiffusionPipeline
+    else:
+        tokenizer_cls = CLIPTokenizer
+        text_encoder_cls = CLIPTextModel
+        pipe_cls = StableDiffusionPipeline
+    
+    
     noise_scheduler = DDPMScheduler.from_pretrained(args.pretrained_model_name_or_path, subfolder="scheduler")
-    tokenizer = CLIPTokenizer.from_pretrained(
+    tokenizer = tokenizer_cls.from_pretrained(
         args.pretrained_model_name_or_path, subfolder="tokenizer", revision=args.revision
     )
-    text_encoder = CLIPTextModel.from_pretrained(
+    text_encoder = text_encoder_cls.from_pretrained(
         args.pretrained_model_name_or_path, subfolder="text_encoder", revision=args.revision
     )
     vae = AutoencoderKL.from_pretrained(args.pretrained_model_name_or_path, subfolder="vae", revision=args.revision)
@@ -421,9 +504,33 @@ def main():
         optimizer_cls = bnb.optim.AdamW8bit
     else:
         optimizer_cls = torch.optim.AdamW
+    
+    # Specify params to optimize
+    if args.finetune_strategry == "unet":
+        parameters_to_optimize = unet.parameters()
+    elif args.finetune_strategry == "unet_cross_attn":
+        parameters_to_optimize = []
+        for name, param in unet.named_parameters():
+            if 'attn2' in name:
+                parameters_to_optimize.append(param)
+            else:
+                param.requires_grad_(False)
 
+    elif args.finetune_strategry == "unet_attn":
+        parameters_to_optimize = []
+        for name, param in unet.named_parameters():
+            if 'attn1' in name or 'attn2' in name:
+                parameters_to_optimize.append(param)
+            else:
+                param.requires_grad_(False)
+    elif args.finetune_strategry == "unet_attn_then_resnet":
+        raise NotImplementedError
+    else: 
+        raise NotImplementedError
+    
+    
     optimizer = optimizer_cls(
-        unet.parameters(),
+        parameters_to_optimize,
         lr=args.learning_rate,
         betas=(args.adam_beta1, args.adam_beta2),
         weight_decay=args.adam_weight_decay,
@@ -483,7 +590,12 @@ def main():
         captions = []
         for caption in examples[caption_column]:
             if isinstance(caption, str):
+                
+                if args.condition_dropping_rate:
+                    if random.random() < args.condition_dropping_rate:
+                        caption = ""
                 captions.append(caption)
+                
             elif isinstance(caption, (list, np.ndarray)):
                 # take a random caption if there are multiple
                 captions.append(random.choice(caption) if is_train else caption[0])
@@ -578,13 +690,29 @@ def main():
 
     # We need to initialize the trackers we use, and also store our configuration.
     # The trackers initializes automatically on the main process.
-    if accelerator.is_main_process:
-        accelerator.init_trackers("text2image-fine-tune", config=vars(args))
+    
+    def get_run_name(args) -> str:
+        m = args.pretrained_model_name_or_path.split("/")[-1]
+        ds = args.dataset_name.split("/")[-1]
+        ft = args.finetune_strategry
+        lr = args.learning_rate
+        ucg = args.condition_dropping_rate
+        ts = arrow.now('Asia/Tokyo').format("YYYY-MM-DDTHH:mm")
+        
+        return '|'.join([f'{k}:{v}' for k, v in locals().items() if k != 'args'])
+    
+    if accelerator.is_main_process:        
+        run_name = get_run_name(args)
+        config = {k: v for k, v in vars(args).items()}
+        accelerator.init_trackers(args.project_name, 
+                                  config=config, 
+                                  init_kwargs={"wandb": {"name": run_name}})
 
     # Train!
     total_batch_size = args.train_batch_size * accelerator.num_processes * args.gradient_accumulation_steps
 
     logger.info("***** Running training *****")
+    logger.info(f"  Finetuning Strategy = {args.finetune_strategry}")
     logger.info(f"  Num examples = {len(train_dataset)}")
     logger.info(f"  Num Epochs = {args.num_train_epochs}")
     logger.info(f"  Instantaneous batch size per device = {args.train_batch_size}")
@@ -622,11 +750,92 @@ def main():
     # Only show the progress bar once on each machine.
     progress_bar = tqdm(range(global_step, args.max_train_steps), disable=not accelerator.is_local_main_process)
     progress_bar.set_description("Steps")
+    
+    # track initial status before any trainiing
+    @torch.no_grad()
+    def evaluate(args, pipe, global_step, prompts):
+        generator = torch.Generator(device=pipe.device).manual_seed(args.seed)
 
+        pipe.unet.eval()
+
+        images = []
+        start_idx = 0
+        end_idx = args.eval_batch_size
+        batch_prompts = prompts[start_idx:end_idx]
+
+        while batch_prompts:
+            with autocast():
+                o = pipe(
+                    prompt=batch_prompts,
+                    num_images_per_prompt=1, 
+                    generator=generator,
+                    num_inference_steps=args.num_inference_steps, 
+                )
+            images.extend(o.images)
+
+
+            start_idx = end_idx
+            end_idx += args.eval_batch_size
+            batch_prompts = prompts[start_idx:end_idx]
+
+        return images
+    
+    
+    if accelerator.is_main_process:
+        wandb_tracker = accelerator.get_tracker("wandb")
+        
+        if global_step == 0:
+            
+            # build a pipe just for easier inference
+            # pipe = pipe_cls(
+            pipe = DiffusionPipeline.from_pretrained(
+                args.pretrained_model_name_or_path,
+                text_encoder=text_encoder,
+                tokenizer=tokenizer,
+                vae=vae,
+                unet=accelerator.unwrap_model(unet),
+                scheduler=inference_scheduler,
+                safety_checker=None,
+                feature_extractor=None,
+                torch_dtype=weight_dtype,
+            )
+            
+            torch.cuda.empty_cache()
+            pipe = pipe.to(accelerator.device)
+            pipe.set_progress_bar_config(disable=True)
+            
+        
+            # log some images in the training data
+            train_batch = dataset['train'][:args.num_log_image_size]
+            imgs = []
+            for img, txt in zip(train_batch['image'], train_batch['text']):
+                imgs.append(wandb.Image(img, caption=txt))
+            wandb_tracker.log({'training_images': imgs}, step=global_step)
+
+            train_prompts = train_batch['text']
+        
+        
+            # conditional 
+            imgs = evaluate(args, pipe, global_step, train_prompts)
+            imgs = [wandb.Image(i, caption=c) for i, c in zip(imgs, train_prompts)]
+            wandb_tracker.log({'conditional': imgs}, step=global_step)
+
+            # unconditional
+            empty_prompts = [""] * len(train_prompts)
+            imgs = evaluate(args, pipe, global_step, empty_prompts)
+            imgs = [wandb.Image(i, caption=c) for i, c in zip(imgs, empty_prompts)]
+            wandb_tracker.log({'unconditional': imgs}, step=global_step)
+            
+            del pipe
+            torch.cuda.empty_cache()
+            gc.collect()
+    
+    
     for epoch in range(first_epoch, args.num_train_epochs):
-        unet.train()
         train_loss = 0.0
         for step, batch in enumerate(train_dataloader):
+            unet.train()
+            
             # Skip steps until we reach the resumed step
             if args.resume_from_checkpoint and epoch == first_epoch and step < resume_step:
                 if step % args.gradient_accumulation_steps == 0:
@@ -679,7 +888,7 @@ def main():
             # Checks if the accelerator has performed an optimization step behind the scenes
             if accelerator.sync_gradients:
                 if args.use_ema:
-                    ema_unet.step(unet.parameters())
+                    ema_unet.step(unet.parameters())  # TODO
                 progress_bar.update(1)
                 global_step += 1
                 accelerator.log({"train_loss": train_loss}, step=global_step)
@@ -690,6 +899,46 @@ def main():
                         save_path = os.path.join(args.output_dir, f"checkpoint-{global_step}")
                         accelerator.save_state(save_path)
                         logger.info(f"Saved state to {save_path}")
+                        
+                        if args.push_to_hub:
+                            repo.push_to_hub(commit_message=f"checkpoint-{global_step}", 
+                                             blocking=False, auto_lfs_prune=True)
+                        
+                if global_step % args.eval_steps == 0:
+                    if accelerator.is_main_process:
+                        # build a pipe just for easier inference
+                        pipe = DiffusionPipeline.from_pretrained(
+                            args.pretrained_model_name_or_path,
+                            text_encoder=text_encoder,
+                            tokenizer=tokenizer,
+                            vae=vae,
+                            unet=accelerator.unwrap_model(unet),
+                            scheduler=inference_scheduler,
+                            safety_checker=None,
+                            feature_extractor=None,
+                            torch_dtype=weight_dtype,
+                        )
+                        torch.cuda.empty_cache()
+                        pipe = pipe.to(accelerator.device)
+                        pipe.set_progress_bar_config(disable=True)
+                        
+                        # conditional 
+                        imgs = evaluate(args, pipe, global_step, train_prompts)
+                        imgs = [wandb.Image(i, caption=c) for i, c in zip(imgs, train_prompts)]
+                        wandb_tracker.log({'conditional': imgs}, step=global_step)
+                        
+                        # unconditional
+                        empty_prompts = [""] * len(train_prompts)
+                        imgs = evaluate(args, pipe, global_step, empty_prompts)
+                        imgs = [wandb.Image(i, caption=c) for i, c in zip(imgs, empty_prompts)]
+                        wandb_tracker.log({'unconditional': imgs}, step=global_step)
+                        
+                        del pipe
+                        torch.cuda.empty_cache()
+                        gc.collect()
+                        
+                
+                # TODO: unet attn -> resnet/unet
 
             logs = {"step_loss": loss.detach().item(), "lr": lr_scheduler.get_last_lr()[0]}
             progress_bar.set_postfix(**logs)
@@ -704,14 +953,14 @@ def main():
         if args.use_ema:
             ema_unet.copy_to(unet.parameters())
 
-        pipeline = StableDiffusionPipeline.from_pretrained(
+        pipe = pipe_cls.from_pretrained(
             args.pretrained_model_name_or_path,
             text_encoder=text_encoder,
             vae=vae,
             unet=unet,
             revision=args.revision,
         )
-        pipeline.save_pretrained(args.output_dir)
+        pipe.save_pretrained(args.output_dir)
 
         if args.push_to_hub:
             repo.push_to_hub(commit_message="End of training", blocking=False, auto_lfs_prune=True)
