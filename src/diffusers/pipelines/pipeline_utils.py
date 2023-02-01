@@ -664,10 +664,11 @@ class DiffusionPipeline(ConfigMixin):
                             f" {expected_class_obj}"
                         )
                 else:
-                    logger.warning(
-                        f"You have passed a non-standard module {passed_class_obj[name]}. We cannot verify whether it"
-                        " has the correct type"
-                    )
+                    pass
+                    # logger.warning(
+                    #     f"You have passed a non-standard module {passed_class_obj[name]}. We cannot verify whether it"
+                    #     " has the correct type"
+                    # )
 
                 # set passed class object
                 loaded_sub_model = passed_class_obj[name]
