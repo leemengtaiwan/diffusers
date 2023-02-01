@@ -14,6 +14,7 @@
 # See the License for the specific language governing permissions and
 
 import argparse
+import multiprocessing
 import logging
 import math
 import wandb
@@ -350,6 +351,13 @@ def parse_args():
         help=""
     )
     
+    parser.add_argument(
+        "--streaming",
+        default=False,
+        action="store_true",
+        help="",
+    )
+    
     
 
     args = parser.parse_args()
@@ -537,33 +545,10 @@ def main():
         eps=args.adam_epsilon,
     )
 
-    # Get the datasets: you can either provide your own training and evaluation files (see below)
-    # or specify a Dataset from the hub (the dataset will be downloaded automatically from the datasets Hub).
-
-    # In distributed training, the load_dataset function guarantees that only one local process can concurrently
-    # download the dataset.
-    if args.dataset_name is not None:
-        # Downloading and loading a dataset from the hub.
-        dataset = load_dataset(
-            args.dataset_name,
-            args.dataset_config_name,
-            cache_dir=args.cache_dir,
-        )
-    else:
-        data_files = {}
-        if args.train_data_dir is not None:
-            data_files["train"] = os.path.join(args.train_data_dir, "**")
-        dataset = load_dataset(
-            "imagefolder",
-            data_files=data_files,
-            cache_dir=args.cache_dir,
-        )
-        # See more about loading custom images at
-        # https://huggingface.co/docs/datasets/v2.4.0/en/image_load#imagefolder
-
     # Preprocessing the datasets.
     # We need to tokenize inputs and targets.
-    column_names = dataset["train"].column_names
+    # column_names = dataset["train"].column_names  # FIXME: disable this temporarily
+    column_names = ["image", "text", "filtered_tag_names"]
 
     # 6. Get the column names for input/target.
     dataset_columns = dataset_name_mapping.get(args.dataset_name, None)
@@ -624,12 +609,40 @@ def main():
         examples["pixel_values"] = [train_transforms(image) for image in images]
         examples["input_ids"] = tokenize_captions(examples)
         return examples
+    
+    
+    # Get the datasets: you can either provide your own training and evaluation files (see below)
+    # or specify a Dataset from the hub (the dataset will be downloaded automatically from the datasets Hub).
 
+    # In distributed training, the load_dataset function guarantees that only one local process can concurrently
+    # download the dataset.
     with accelerator.main_process_first():
+        dataset = load_dataset(
+            args.dataset_name,
+            args.dataset_config_name,
+            cache_dir=args.cache_dir,
+            streaming=args.streaming,
+            use_auth_token=True,
+            num_proc=multiprocessing.cpu_count(),
+        )
+
+        train_dataset = dataset["train"]
+        if args.streaming:
+            train_dataset = train_dataset.with_format("torch")
+            
+        train_dataset = train_dataset.shuffle(seed=args.seed)
+        
         if args.max_train_samples is not None:
-            dataset["train"] = dataset["train"].shuffle(seed=args.seed).select(range(args.max_train_samples))
-        # Set the training transforms
-        train_dataset = dataset["train"].with_transform(preprocess_train)
+            train_dataset = train_dataset.select(range(args.max_train_samples))
+
+        # train_dataset = train_dataset.map(
+        #     preprocess_train, 
+        #     batched=True, 
+        #     num_proc=multiprocessing.cpu_count(),
+        # )
+        
+    train_dataset = train_dataset.with_transform(preprocess_train)
+        
 
     def collate_fn(examples):
         pixel_values = torch.stack([example["pixel_values"] for example in examples])
@@ -640,15 +653,27 @@ def main():
     # DataLoaders creation:
     train_dataloader = torch.utils.data.DataLoader(
         train_dataset,
-        shuffle=True,
+        shuffle=False,
         collate_fn=collate_fn,
         batch_size=args.train_batch_size,
         num_workers=args.dataloader_num_workers,
     )
 
     # Scheduler and math around the number of training steps.
+    # FIXME: adhoc
+    if args.streaming:
+        if '647k' in args.dataset_name:
+            dataset_size = 647172
+            dataloader_len = dataset_size / args.train_batch_size
+        else:
+            raise NotImplementedError
+    else:
+        dataset_size = len(train_dataset)
+        dataloader_len = len(train_dataloader)
+    
+    
     overrode_max_train_steps = False
-    num_update_steps_per_epoch = math.ceil(len(train_dataloader) / args.gradient_accumulation_steps)
+    num_update_steps_per_epoch = math.ceil(dataloader_len / args.gradient_accumulation_steps)
     if args.max_train_steps is None:
         args.max_train_steps = args.num_train_epochs * num_update_steps_per_epoch
         overrode_max_train_steps = True
@@ -682,7 +707,7 @@ def main():
         ema_unet.to(accelerator.device)
 
     # We need to recalculate our total training steps as the size of the training dataloader may have changed.
-    num_update_steps_per_epoch = math.ceil(len(train_dataloader) / args.gradient_accumulation_steps)
+    num_update_steps_per_epoch = math.ceil(dataloader_len / args.gradient_accumulation_steps)
     if overrode_max_train_steps:
         args.max_train_steps = args.num_train_epochs * num_update_steps_per_epoch
     # Afterwards we recalculate our number of training epochs
@@ -713,7 +738,7 @@ def main():
 
     logger.info("***** Running training *****")
     logger.info(f"  Finetuning Strategy = {args.finetune_strategry}")
-    logger.info(f"  Num examples = {len(train_dataset)}")
+    logger.info(f"  Num examples = {dataset_size}")
     logger.info(f"  Num Epochs = {args.num_train_epochs}")
     logger.info(f"  Instantaneous batch size per device = {args.train_batch_size}")
     logger.info(f"  Total train batch size (w. parallel, distributed & accumulation) = {total_batch_size}")
@@ -787,8 +812,7 @@ def main():
         if global_step == 0:
             
             # build a pipe just for easier inference
-            # pipe = pipe_cls(
-            pipe = DiffusionPipeline.from_pretrained(
+            pipe = pipe_cls.from_pretrained(
                 args.pretrained_model_name_or_path,
                 text_encoder=text_encoder,
                 tokenizer=tokenizer,
@@ -796,6 +820,7 @@ def main():
                 unet=accelerator.unwrap_model(unet),
                 scheduler=inference_scheduler,
                 safety_checker=None,
+                requires_safety_checker=False,
                 feature_extractor=None,
                 torch_dtype=weight_dtype,
             )
@@ -806,14 +831,21 @@ def main():
             
         
             # log some images in the training data
-            train_batch = dataset['train'][:args.num_log_image_size]
+            if args.streaming:
+                examples = list(train_dataset.take(args.num_log_image_size))
+                images = [e['image'] for e in examples]
+                texts = [e['text'] for e in examples]
+            else:
+                train_batch = train_dataset[:args.num_log_image_size]
+                images = train_batch['image']
+                texts = train_batch['text']
+            
             imgs = []
-            for img, txt in zip(train_batch['image'], train_batch['text']):
+            for img, txt in zip(images, texts):
                 imgs.append(wandb.Image(img, caption=txt))
             wandb_tracker.log({'training_images': imgs}, step=global_step)
 
-            train_prompts = train_batch['text']
-        
+            train_prompts = texts
         
             # conditional 
             imgs = evaluate(args, pipe, global_step, train_prompts)
@@ -906,8 +938,7 @@ def main():
                         
                 if global_step % args.eval_steps == 0:
                     if accelerator.is_main_process:
-                        # build a pipe just for easier inference
-                        pipe = DiffusionPipeline.from_pretrained(
+                        pipe = pipe_cls.from_pretrained(
                             args.pretrained_model_name_or_path,
                             text_encoder=text_encoder,
                             tokenizer=tokenizer,
@@ -915,6 +946,7 @@ def main():
                             unet=accelerator.unwrap_model(unet),
                             scheduler=inference_scheduler,
                             safety_checker=None,
+                            requires_safety_checker=False,
                             feature_extractor=None,
                             torch_dtype=weight_dtype,
                         )
