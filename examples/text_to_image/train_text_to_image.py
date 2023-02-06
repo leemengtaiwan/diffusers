@@ -24,6 +24,7 @@ import arrow
 import random
 from pathlib import Path
 from typing import Optional
+from pprint import pformat
 
 import numpy as np
 import torch
@@ -142,12 +143,18 @@ def parse_args():
         help="The output directory where the model predictions and checkpoints will be written.",
     )
     parser.add_argument(
+        "--dont_append_run_name_in_output_dir",
+        default=False,
+        action="store_true",
+        help="",
+    )
+    parser.add_argument(
         "--cache_dir",
         type=str,
         default=None,
         help="The directory where the downloaded models and datasets will be stored.",
     )
-    parser.add_argument("--seed", type=int, default=None, help="A seed for reproducible training.")
+    parser.add_argument("--seed", type=int, default=19901022, help="A seed for reproducible training.")
     parser.add_argument(
         "--resolution",
         type=int,
@@ -410,9 +417,31 @@ dataset_name_mapping = {
     "lambdalabs/pokemon-blip-captions": ("image", "text"),
 }
 
+def get_run_name(args) -> str:
+    m = args.pretrained_model_name_or_path.split("/")[-1]
+
+    if args.pretrained_model_name_or_path_for_text_encoder:
+        t = args.pretrained_model_name_or_path_for_text_encoder.split("/")[-1]
+
+    if args.pretrained_model_name_or_path_for_unet:
+        u = args.pretrained_model_name_or_path_for_unet.split("/")[-1]
+
+    ds = args.dataset_name.split("/")[-1]
+    ft = args.finetune_strategry
+    lr = args.learning_rate
+    ucg = args.condition_dropping_rate
+    ts = arrow.now('Asia/Tokyo').format("YYYY-MM-DDTHH:mm")
+
+    return '|'.join([f'{k}:{v}' for k, v in locals().items() if k != 'args'])
+
 
 def main():
     args = parse_args()
+    run_name = get_run_name(args)
+    
+    if not args.dont_append_run_name_in_output_dir:
+        args.output_dir = "-".join((args.output_dir, run_name))
+    
     logging_dir = os.path.join(args.output_dir, args.logging_dir)
 
     accelerator = Accelerator(
@@ -429,7 +458,7 @@ def main():
         level=logging.INFO,
     )
     logger.info(accelerator.state, main_process_only=False)
-    logger.info(args)
+    logger.info(pformat(args))
     
     if accelerator.is_local_main_process:
         datasets.utils.logging.set_verbosity_warning()
@@ -780,26 +809,9 @@ def main():
 
     # We need to initialize the trackers we use, and also store our configuration.
     # The trackers initializes automatically on the main process.
-     
-    def get_run_name(args) -> str:
-        m = args.pretrained_model_name_or_path.split("/")[-1]
-        
-        if args.pretrained_model_name_or_path_for_text_encoder:
-            t = args.pretrained_model_name_or_path_for_text_encoder.split("/")[-1]
-        
-        if args.pretrained_model_name_or_path_for_unet:
-            u = args.pretrained_model_name_or_path_for_unet.split("/")[-1]
-        
-        ds = args.dataset_name.split("/")[-1]
-        ft = args.finetune_strategry
-        lr = args.learning_rate
-        ucg = args.condition_dropping_rate
-        ts = arrow.now('Asia/Tokyo').format("YYYY-MM-DDTHH:mm")
-        
-        return '|'.join([f'{k}:{v}' for k, v in locals().items() if k != 'args'])
     
     if accelerator.is_main_process:        
-        run_name = get_run_name(args)
+        
         config = {k: v for k, v in vars(args).items()}
         accelerator.init_trackers(args.project_name, 
                                   config=config, 
@@ -902,7 +914,7 @@ def main():
             pipe.set_progress_bar_config(disable=True)
             
         
-            # log some images in the training data
+            # log some images in the training data for checking training process
             if args.streaming:
                 examples = list(train_dataset.take(args.num_log_image_size))
                 images = [e['image'] for e in examples]
@@ -915,20 +927,21 @@ def main():
             imgs = []
             for img, txt in zip(images, texts):
                 imgs.append(wandb.Image(img, caption=txt))
-            wandb_tracker.log({'training_images': imgs}, step=global_step)
+            wandb_tracker.log({'conditional': imgs}, step=0)
 
             train_prompts = texts
         
             # conditional 
             imgs = evaluate(args, pipe, global_step, train_prompts)
             imgs = [wandb.Image(i, caption=c) for i, c in zip(imgs, train_prompts)]
-            wandb_tracker.log({'conditional': imgs}, step=global_step)
+            # set step=1 for easier comparison with training data
+            wandb_tracker.log({'conditional': imgs}, step=1)  
 
             # unconditional
             empty_prompts = [""] * len(train_prompts)
             imgs = evaluate(args, pipe, global_step, empty_prompts)
             imgs = [wandb.Image(i, caption=c) for i, c in zip(imgs, empty_prompts)]
-            wandb_tracker.log({'unconditional': imgs}, step=global_step)
+            wandb_tracker.log({'unconditional': imgs}, step=0)
             
             del pipe
             torch.cuda.empty_cache()
