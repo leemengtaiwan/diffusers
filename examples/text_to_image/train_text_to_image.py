@@ -77,6 +77,20 @@ def parse_args():
         help="Revision of pretrained model identifier from huggingface.co/models.",
     )
     parser.add_argument(
+        "--pretrained_model_name_or_path_for_text_encoder",
+        type=str,
+        default=None,
+        required=False,
+        help="",
+    )
+    parser.add_argument(
+        "--pretrained_model_name_or_path_for_unet",
+        type=str,
+        default=None,
+        required=False,
+        help="",
+    )
+    parser.add_argument(
         "--dataset_name",
         type=str,
         default=None,
@@ -358,8 +372,13 @@ def parse_args():
         help="",
     )
     
+    parser.add_argument(
+        "--transform_all_data_before_training",
+        default=False,
+        action="store_true",
+        help="",
+    )
     
-
     args = parser.parse_args()
     env_local_rank = int(os.environ.get("LOCAL_RANK", -1))
     if env_local_rank != -1 and env_local_rank != args.local_rank:
@@ -409,6 +428,7 @@ def main():
         level=logging.INFO,
     )
     logger.info(accelerator.state, main_process_only=False)
+    logger.info(args)
     
     if accelerator.is_local_main_process:
         datasets.utils.logging.set_verbosity_warning()
@@ -448,6 +468,7 @@ def main():
     inference_scheduler = eval(args.inference_scheduler_cls).from_pretrained(
         args.pretrained_model_name_or_path, subfolder="scheduler")
     
+    # define component cls based on general pretrained model name
     if args.pretrained_model_name_or_path == "BAAI/AltDiffusion-m9":
         tokenizer_cls = XLMRobertaTokenizer
         text_encoder_cls = RobertaSeriesModelWithTransformation
@@ -456,18 +477,45 @@ def main():
         tokenizer_cls = CLIPTokenizer
         text_encoder_cls = CLIPTextModel
         pipe_cls = StableDiffusionPipeline
+        
+    # overwrite above component cls if needed
+    text_enc_path = args.pretrained_model_name_or_path_for_text_encoder
+    if text_enc_path:
+        if text_enc_path == "BAAI/AltDiffusion-m9":
+            tokenizer_cls = XLMRobertaTokenizer
+            text_encoder_cls = RobertaSeriesModelWithTransformation
+        else:
+            tokenizer_cls = CLIPTokenizer
+            text_encoder_cls = CLIPTextModel
     
+    noise_scheduler = DDPMScheduler.from_pretrained(
+        args.pretrained_model_name_or_path, subfolder="scheduler")
+        
+    vae = AutoencoderKL.from_pretrained(
+        args.pretrained_model_name_or_path, subfolder="vae", revision=args.revision)
     
-    noise_scheduler = DDPMScheduler.from_pretrained(args.pretrained_model_name_or_path, subfolder="scheduler")
+    # use specific text-encoder if specified
+    if text_enc_path:
+        text_component_path = text_enc_path
+    else:
+        text_component_path = args.pretrained_model_name_or_path
+    
+    logger.info(f"text_component_path: {text_component_path}, tokenizer_cls: {tokenizer_cls}")
     tokenizer = tokenizer_cls.from_pretrained(
-        args.pretrained_model_name_or_path, subfolder="tokenizer", revision=args.revision
+        text_component_path, subfolder="tokenizer", revision=args.revision
     )
     text_encoder = text_encoder_cls.from_pretrained(
-        args.pretrained_model_name_or_path, subfolder="text_encoder", revision=args.revision
+        text_component_path, subfolder="text_encoder", revision=args.revision
     )
-    vae = AutoencoderKL.from_pretrained(args.pretrained_model_name_or_path, subfolder="vae", revision=args.revision)
+    
+    # use specific unet if specified
+    if args.pretrained_model_name_or_path_for_unet:
+        unet_path = args.pretrained_model_name_or_path_for_unet
+    else:
+        unet_path = args.pretrained_model_name_or_path
+    
     unet = UNet2DConditionModel.from_pretrained(
-        args.pretrained_model_name_or_path, subfolder="unet", revision=args.non_ema_revision
+        unet_path, subfolder="unet", revision=args.non_ema_revision
     )
 
     # Freeze vae and text_encoder
@@ -477,7 +525,7 @@ def main():
     # Create EMA for the unet.
     if args.use_ema:
         ema_unet = UNet2DConditionModel.from_pretrained(
-            args.pretrained_model_name_or_path, subfolder="unet", revision=args.revision
+            unet_path, subfolder="unet", revision=args.revision
         )
         ema_unet = EMAModel(ema_unet.parameters())
 
@@ -634,14 +682,16 @@ def main():
         
         if args.max_train_samples is not None:
             train_dataset = train_dataset.select(range(args.max_train_samples))
-
-        # train_dataset = train_dataset.map(
-        #     preprocess_train, 
-        #     batched=True, 
-        #     num_proc=multiprocessing.cpu_count(),
-        # )
         
-    train_dataset = train_dataset.with_transform(preprocess_train)
+        if args.transform_all_data_before_training:
+            train_dataset = train_dataset.map(
+                preprocess_train, 
+                batched=True, 
+                num_proc=multiprocessing.cpu_count(),
+            )
+            
+    if not args.transform_all_data_before_training:
+        train_dataset = train_dataset.with_transform(preprocess_train)
         
 
     def collate_fn(examples):
@@ -715,9 +765,16 @@ def main():
 
     # We need to initialize the trackers we use, and also store our configuration.
     # The trackers initializes automatically on the main process.
-    
+     
     def get_run_name(args) -> str:
         m = args.pretrained_model_name_or_path.split("/")[-1]
+        
+        if args.pretrained_model_name_or_path_for_text_encoder:
+            t = args.pretrained_model_name_or_path_for_text_encoder.split("/")[-1]
+        
+        if args.pretrained_model_name_or_path_for_unet:
+            u = args.pretrained_model_name_or_path_for_unet.split("/")[-1]
+        
         ds = args.dataset_name.split("/")[-1]
         ft = args.finetune_strategry
         lr = args.learning_rate
