@@ -49,9 +49,10 @@ from diffusers.utils.import_utils import is_xformers_available
 from huggingface_hub import HfFolder, Repository, create_repo, whoami
 from torchvision import transforms
 from tqdm.auto import tqdm
-from transformers import CLIPTextModel, CLIPTokenizer
-from transformers import XLMRobertaTokenizer
+from transformers import CLIPTextModel
+from transformers import CLIPTokenizer, XLMRobertaTokenizer, T5Tokenizer
 
+from japanese_stable_diffusion import JapaneseStableDiffusionPipeline
 
 
 # Will error if the minimal version of diffusers is not installed. Remove at your own risks.
@@ -473,6 +474,10 @@ def main():
         tokenizer_cls = XLMRobertaTokenizer
         text_encoder_cls = RobertaSeriesModelWithTransformation
         pipe_cls = AltDiffusionPipeline
+    elif args.pretrained_model_name_or_path == "rinna/japanese-stable-diffusion":
+        tokenizer_cls = T5Tokenizer
+        text_encoder_cls = CLIPTextModel
+        pipe_cls = JapaneseStableDiffusionPipeline
     else:
         tokenizer_cls = CLIPTokenizer
         text_encoder_cls = CLIPTextModel
@@ -484,6 +489,9 @@ def main():
         if text_enc_path == "BAAI/AltDiffusion-m9":
             tokenizer_cls = XLMRobertaTokenizer
             text_encoder_cls = RobertaSeriesModelWithTransformation
+        elif text_enc_path == "rinna/japanese-stable-diffusion":
+            tokenizer_cls = T5Tokenizer
+            text_encoder_cls = CLIPTextModel
         else:
             tokenizer_cls = CLIPTokenizer
             text_encoder_cls = CLIPTextModel
@@ -504,6 +512,13 @@ def main():
     tokenizer = tokenizer_cls.from_pretrained(
         text_component_path, subfolder="tokenizer", revision=args.revision
     )
+    
+    # FIXME: assume JSD
+    # https://github.com/rinnakk/japanese-stable-diffusion/blob/342c345ae00de554b4f96872692c69d5ea2996dc/src/japanese_stable_diffusion/pipeline_stable_diffusion.py#L37
+    if tokenizer.__class__ is T5Tokenizer:
+        tokenizer.do_lower_case = True
+        tokenizer.model_max_length = 77
+    
     text_encoder = text_encoder_cls.from_pretrained(
         text_component_path, subfolder="text_encoder", revision=args.revision
     )
