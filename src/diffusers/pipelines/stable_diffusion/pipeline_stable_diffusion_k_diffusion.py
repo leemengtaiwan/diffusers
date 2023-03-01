@@ -393,7 +393,7 @@ class StableDiffusionKDiffusionPipeline(DiffusionPipeline):
         return_dict: bool = True,
         callback: Optional[Callable[[int, int, torch.FloatTensor], None]] = None,
         callback_steps: int = 1,
-        use_karras_sigmas=True,
+        use_karras_sigmas: bool = True,
     ):
         r"""
         Function invoked when calling the pipeline for generation.
@@ -450,6 +450,8 @@ class StableDiffusionKDiffusionPipeline(DiffusionPipeline):
             callback_steps (`int`, *optional*, defaults to 1):
                 The frequency at which the `callback` function will be called. If not specified, the callback will be
                 called at every step.
+            use_karras_sigmas (`bool`, *optional*):
+                Whether to apply Karras sigmas.
 
         Returns:
             [`~pipelines.stable_diffusion.StableDiffusionPipelineOutput`] or `tuple`:
